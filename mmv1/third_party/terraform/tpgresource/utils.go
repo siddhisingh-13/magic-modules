@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -40,9 +41,11 @@ type TerraformResourceData interface {
 	GetOkExists(string) (interface{}, bool)
 	GetOk(string) (interface{}, bool)
 	Get(string) interface{}
+	GetRawConfig() cty.Value
 	Set(string, interface{}) error
 	SetId(string)
 	Id() string
+	Identity() (*schema.IdentityData, error)
 	GetProviderMeta(interface{}) error
 	Timeout(key string) time.Duration
 }
@@ -193,6 +196,11 @@ func IsConflictError(err error) bool {
 	} else if !ok && errwrap.ContainsType(err, &googleapi.Error{}) {
 		e := errwrap.GetType(err, &googleapi.Error{}).(*googleapi.Error)
 		if e.Code == 409 || e.Code == 412 {
+			return true
+		}
+	} else if gErr := (*googleapi.Error)(nil); errors.As(err, &gErr) {
+		// For cases where the error is not wrapped by errwrap such in 409 IAM concurrency errors.
+		if gErr.Code == 409 || gErr.Code == 412 {
 			return true
 		}
 	}
@@ -984,4 +992,21 @@ func NormalizeIamPrincipalCasing(principal string) string {
 		principal = strings.Join(pieces, ":")
 	}
 	return principal
+}
+
+// hash based normalized IP addresses in CIDR notation
+func IpAddrSetHashFunc(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+
+	m := v.(string)
+	log.Printf("[DEBUG] hashing %v", m)
+	_, ipnet, err := net.ParseCIDR(m)
+	if err != nil {
+		//if invalid cidr, hash based on the direct value without standardizing.
+		return Hashcode(m)
+	}
+	log.Printf("[DEBUG] computed hash value of %v from %v", Hashcode(ipnet.String()), ipnet.String())
+	return Hashcode(ipnet.String())
 }

@@ -12,7 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"magician/cov"
 	"magician/exec"
 	"magician/github"
 	"magician/provider"
@@ -83,19 +82,6 @@ type recordReplay struct {
 	BrowseLogBaseUrl              string
 }
 
-const (
-	covGCSPrefix = "gs://test-coverage-data"
-)
-
-type runCovOpts struct {
-	repo         *source.Repo
-	buildID      string
-	commitSha    string
-	covGCSPrefix string
-	testDirs     []string
-	prNumber     string
-}
-
 var testTerraformVCRCmd = &cobra.Command{
 	Use:   "test-terraform-vcr",
 	Short: "Run vcr tests for affected packages",
@@ -107,6 +93,7 @@ It expects the following arguments:
 	3. Build ID
 	4. Project ID where Cloud Builds are located
 	5. Build step number
+	6. Enable async upload cassettes
 
 The following environment variables are required:
 ` + listTTVRequiredEnvironmentVariables(),
@@ -148,21 +135,20 @@ The following environment variables are required:
 		}
 		ctlr := source.NewController(env["GOPATH"], "modular-magician", env["GITHUB_TOKEN_DOWNSTREAMS"], rnr)
 
-		testCovMerger, err := cov.NewTestCovMerger(rnr, filepath.Join(os.TempDir(), "cov"))
-		if err != nil {
-			return fmt.Errorf("failed to create testCovMerger: %w", err)
+		if len(args) < 5 {
+			return fmt.Errorf("wrong number of arguments %d, expected >=5", len(args))
+		}
+		enableAsyncUploadCassettes := false
+		if len(args) > 5 {
+			enableAsyncUploadCassettes = strings.ToLower(args[5]) == "true"
 		}
 
-		vt, err := vcr.NewTester(env, "ci-vcr-cassettes", "ci-vcr-logs", rnr)
+		vt, err := vcr.NewTester(env, "ci-vcr-cassettes", "ci-vcr-logs", rnr, enableAsyncUploadCassettes)
 		if err != nil {
 			return fmt.Errorf("error creating VCR tester: %w", err)
 		}
 
-		if len(args) != 5 {
-			return fmt.Errorf("wrong number of arguments %d, expected 5", len(args))
-		}
-
-		return execTestTerraformVCR(args[0], args[1], args[2], args[3], args[4], baseBranch, gh, rnr, ctlr, vt, testCovMerger)
+		return execTestTerraformVCR(args[0], args[1], args[2], args[3], args[4], baseBranch, gh, rnr, ctlr, vt)
 	},
 }
 
@@ -174,7 +160,7 @@ func listTTVRequiredEnvironmentVariables() string {
 	return result
 }
 
-func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, baseBranch string, gh GithubClient, rnr ExecRunner, ctlr *source.Controller, vt *vcr.Tester, covMerger *cov.Merger) error {
+func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, baseBranch string, gh GithubClient, rnr ExecRunner, ctlr *source.Controller, vt *vcr.Tester) error {
 	newBranch := "auto-pr-" + prNumber
 	oldBranch := newBranch + "-old"
 
@@ -230,7 +216,7 @@ func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, 
 		return fmt.Errorf("error posting pending status: %w", err)
 	}
 
-	replayingResult, testDirs, replayingErr := runReplaying(runFullVCR, provider.Beta, services, vt, true, covMerger.VcrTestCovDir)
+	replayingResult, testDirs, replayingErr := runReplaying(runFullVCR, provider.Beta, services, vt)
 	testState := "success"
 	if replayingErr != nil {
 		testState = "failure"
@@ -279,10 +265,11 @@ func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, 
 	}
 	if len(replayingResult.FailedTests) > 0 {
 		recordingResult, recordingErr := vt.RunParallel(vcr.RunOptions{
-			Mode:     vcr.Recording,
-			Version:  provider.Beta,
-			TestDirs: testDirs,
-			Tests:    replayingResult.FailedTests,
+			Mode:             vcr.Recording,
+			Version:          provider.Beta,
+			TestDirs:         testDirs,
+			Tests:            replayingResult.FailedTests,
+			UploadBranchName: newBranch,
 		})
 		if recordingErr != nil {
 			testState = "failure"
@@ -314,12 +301,10 @@ func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, 
 		var replayingAfterRecordingErr error
 		if len(recordingResult.PassedTests) > 0 {
 			replayingAfterRecordingResult, replayingAfterRecordingErr = vt.RunParallel(vcr.RunOptions{
-				Mode:               vcr.Replaying,
-				Version:            provider.Beta,
-				TestDirs:           testDirs,
-				Tests:              recordingResult.PassedTests,
-				EnableTestCoverage: true,
-				TestCovDir:         covMerger.VcrTestCovDir,
+				Mode:     vcr.Replaying,
+				Version:  provider.Beta,
+				TestDirs: testDirs,
+				Tests:    recordingResult.PassedTests,
 			})
 			if replayingAfterRecordingErr != nil {
 				testState = "failure"
@@ -355,25 +340,6 @@ func execTestTerraformVCR(prNumber, mmCommitSha, buildID, projectID, buildStep, 
 		recordReplayComment, err := formatRecordReplay(recordReplayData)
 		if err != nil {
 			return fmt.Errorf("error formatting record replay comment: %w", err)
-		}
-
-		// run unit test and generate combined code coverage
-		if err := genCov(rnr, covMerger, gh, runCovOpts{
-			repo:         tpgbRepo,
-			buildID:      buildID,
-			commitSha:    mmCommitSha,
-			covGCSPrefix: covGCSPrefix,
-			testDirs:     testDirs,
-			prNumber:     prNumber,
-		}); err != nil {
-			fmt.Printf("Failed to generate coverage: %s\n", err)
-		}
-
-		out, err := covMerger.PackageCovComment()
-		if err != nil {
-			fmt.Printf("failed to get package coverage: %s\n", err)
-		} else {
-			recordReplayComment += "\n\n" + out
 		}
 		if err := gh.PostComment(prNumber, recordReplayComment); err != nil {
 			return fmt.Errorf("error posting comment: %w", err)
@@ -490,37 +456,35 @@ func modifiedPackages(changedFiles []string, version provider.Version) (map[stri
 	return services, runFullVCR
 }
 
-func runReplaying(runFullVCR bool, version provider.Version, services map[string]struct{}, vt *vcr.Tester, enableCov bool, covDir string) (vcr.Result, []string, error) {
+func runReplaying(runFullVCR bool, version provider.Version, services map[string]struct{}, vt *vcr.Tester) (vcr.Result, []string, error) {
 	result := vcr.Result{}
 	var testDirs []string
 	var replayingErr error
 	if runFullVCR {
 		fmt.Println("runReplaying: full VCR tests")
 		result, replayingErr = vt.Run(vcr.RunOptions{
-			Mode:               vcr.Replaying,
-			Version:            version,
-			EnableTestCoverage: enableCov,
-			TestCovDir:         covDir,
+			Mode:    vcr.Replaying,
+			Version: version,
 		})
 	} else if len(services) > 0 {
 		fmt.Printf("runReplaying: %d specific services: %v\n", len(services), services)
 		for service := range services {
 			servicePath := "./" + filepath.Join(version.ProviderName(), "services", service)
 			testDirs = append(testDirs, servicePath)
-			fmt.Println("run VCR tests in ", service)
-			serviceResult, serviceReplayingErr := vt.Run(vcr.RunOptions{
-				Mode:               vcr.Replaying,
-				Version:            version,
-				TestDirs:           []string{servicePath},
-				EnableTestCoverage: enableCov,
-				TestCovDir:         covDir,
-			})
-			replayingErr = errors.Join(replayingErr, serviceReplayingErr)
-			result.PassedTests = append(result.PassedTests, serviceResult.PassedTests...)
-			result.SkippedTests = append(result.SkippedTests, serviceResult.SkippedTests...)
-			result.FailedTests = append(result.FailedTests, serviceResult.FailedTests...)
-			result.Panics = append(result.Panics, serviceResult.Panics...)
 		}
+
+		fmt.Printf("run VCR tests in %v\n", testDirs)
+		serviceResult, serviceReplayingErr := vt.Run(vcr.RunOptions{
+			Mode:     vcr.Replaying,
+			Version:  version,
+			TestDirs: testDirs,
+		})
+
+		replayingErr = errors.Join(replayingErr, serviceReplayingErr)
+		result.PassedTests = append(result.PassedTests, serviceResult.PassedTests...)
+		result.SkippedTests = append(result.SkippedTests, serviceResult.SkippedTests...)
+		result.FailedTests = append(result.FailedTests, serviceResult.FailedTests...)
+		result.Panics = append(result.Panics, serviceResult.Panics...)
 	} else {
 		fmt.Println("runReplaying: no impacted services")
 	}
@@ -579,49 +543,4 @@ func formatRecordReplay(data recordReplay) (string, error) {
 	data.LogBaseUrl = fmt.Sprintf("https://storage.cloud.google.com/%s", logBasePath)
 	data.BrowseLogBaseUrl = fmt.Sprintf("https://console.cloud.google.com/storage/browser/%s", logBasePath)
 	return formatComment("record_replay.tmpl", recordReplayTmplText, data)
-}
-
-func unitTest(rnr ExecRunner, repoPath, covDir string, testDirs []string) error {
-	if err := rnr.PushDir(repoPath); err != nil {
-		return fmt.Errorf("error changing to tpgbRepo dir: %w", err)
-	}
-
-	if len(testDirs) == 0 {
-		if allPackages, err := rnr.Run("go", []string{"list", "./..."}, nil); err != nil {
-			return err
-		} else {
-			for _, dir := range strings.Split(allPackages, "\n") {
-				if !strings.Contains(dir, "github.com/hashicorp/terraform-provider-google-beta/scripts") {
-					testDirs = append(testDirs, dir)
-				}
-			}
-		}
-	}
-
-	args := []string{"test", "-p", "4", "-cover"}
-	args = append(args, testDirs...)
-	args = append(args, []string{"-args", fmt.Sprintf("-test.gocoverdir=%s", covDir)}...)
-	_, err := rnr.Run("go", args, nil)
-	if err != nil {
-		return fmt.Errorf("unit test failed with error: %s", err)
-	}
-	return nil
-}
-
-func genCov(rnr ExecRunner, covMerger *cov.Merger, gh GithubClient, opts runCovOpts) error {
-	fmt.Println("Generating code coverage...")
-	if err := unitTest(rnr, opts.repo.Path, covMerger.UnitTestCovDir, opts.testDirs); err != nil {
-		fmt.Println("unit test failed")
-	}
-	if err := covMerger.Merge(); err != nil {
-		return fmt.Errorf("failed to merge test coverage: %w", err)
-	}
-	covURL, err := covMerger.UploadToGCS(opts.covGCSPrefix, opts.buildID)
-	if err != nil {
-		return fmt.Errorf("failed to upload test coverage: %w", err)
-	}
-	if err := gh.PostBuildStatus(opts.prNumber, "test-cov", "success", covURL, opts.commitSha); err != nil {
-		return fmt.Errorf("error posting pending status: %w", err)
-	}
-	return nil
 }

@@ -1,8 +1,6 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
 /*
-	This file is a copy of mmv1/third_party/terraform/services/bigquery/iam_bigquery_dataset.go
-	with new functions mergeAccess and GetCurrentResourceAccess
+This file is a copy of mmv1/third_party/terraform/services/bigquery/iam_bigquery_dataset.go
+with new functions mergeAccess and GetCurrentResourceAccess
 */
 package bigquery
 
@@ -11,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/terraform-provider-google/google/registry"
 	"github.com/hashicorp/terraform-provider-google/google/tpgiamresource"
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
 	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
@@ -348,4 +347,13 @@ func (u *BigqueryDatasetIamMemberUpdater) GetMutexKey() string {
 
 func (u *BigqueryDatasetIamMemberUpdater) DescribeResource() string {
 	return fmt.Sprintf("Bigquery Dataset %s/%s", u.project, u.datasetId)
+}
+
+func init() {
+	registry.Schema{
+		Name:        "google_bigquery_dataset_iam_member",
+		ProductName: "bigquery",
+		Type:        registry.SchemaTypeIAMResource,
+		Schema:      tpgiamresource.ResourceIamMember(IamMemberBigqueryDatasetSchema, NewBigqueryDatasetIamMemberUpdater, BigqueryDatasetIdParseFunc),
+	}.Register()
 }
